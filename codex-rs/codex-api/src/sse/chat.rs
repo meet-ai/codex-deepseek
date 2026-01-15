@@ -71,11 +71,13 @@ pub async fn process_chat_sse<S>(
     let mut assistant_item: Option<ResponseItem> = None;
     let mut reasoning_item: Option<ResponseItem> = None;
     let mut completed_sent = false;
+    let mut assistant_reasoning_content: Option<String> = None; // For DeepSeek reasoning_content
 
     async fn flush_and_complete(
         tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
         reasoning_item: &mut Option<ResponseItem>,
         assistant_item: &mut Option<ResponseItem>,
+        assistant_reasoning_content: &mut Option<String>,
     ) {
         if let Some(reasoning) = reasoning_item.take() {
             let _ = tx_event
@@ -83,7 +85,17 @@ pub async fn process_chat_sse<S>(
                 .await;
         }
 
-        if let Some(assistant) = assistant_item.take() {
+        if let Some(mut assistant) = assistant_item.take() {
+            // Set reasoning_content for DeepSeek assistant messages
+            if let ResponseItem::Message {
+                reasoning_content, ..
+            } = &mut assistant
+            {
+                if let Some(content) = assistant_reasoning_content.take() {
+                    *reasoning_content = Some(content);
+                    tracing::debug!("Set reasoning_content on assistant message");
+                }
+            }
             let _ = tx_event
                 .send(Ok(ResponseEvent::OutputItemDone(assistant)))
                 .await;
@@ -111,7 +123,13 @@ pub async fn process_chat_sse<S>(
             }
             Ok(None) => {
                 if !completed_sent {
-                    flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
+                    flush_and_complete(
+                        &tx_event,
+                        &mut reasoning_item,
+                        &mut assistant_item,
+                        &mut assistant_reasoning_content,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -133,7 +151,13 @@ pub async fn process_chat_sse<S>(
 
         if data == "[DONE]" || data == "DONE" {
             if !completed_sent {
-                flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
+                flush_and_complete(
+                    &tx_event,
+                    &mut reasoning_item,
+                    &mut assistant_item,
+                    &mut assistant_reasoning_content,
+                )
+                .await;
             }
             return;
         }
@@ -241,15 +265,30 @@ pub async fn process_chat_sse<S>(
                 }
             }
 
-            if let Some(message) = choice.get("message")
-                && let Some(reasoning) = message.get("reasoning")
-            {
-                if let Some(text) = reasoning.as_str() {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
-                } else if let Some(text) = reasoning.get("text").and_then(|v| v.as_str()) {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
-                } else if let Some(text) = reasoning.get("content").and_then(|v| v.as_str()) {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
+            if let Some(message) = choice.get("message") {
+                // Handle traditional reasoning
+                if let Some(reasoning) = message.get("reasoning") {
+                    if let Some(text) = reasoning.as_str() {
+                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
+                            .await;
+                    } else if let Some(text) = reasoning.get("text").and_then(|v| v.as_str()) {
+                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
+                            .await;
+                    } else if let Some(text) = reasoning.get("content").and_then(|v| v.as_str()) {
+                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
+                            .await;
+                    }
+                }
+
+                // Handle DeepSeek reasoning_content
+                if let Some(reasoning_content) =
+                    message.get("reasoning_content").and_then(|v| v.as_str())
+                {
+                    assistant_reasoning_content = Some(reasoning_content.to_string());
+                    tracing::debug!(
+                        "Extracted DeepSeek reasoning_content: {}",
+                        reasoning_content.len()
+                    );
                 }
             }
 
@@ -284,12 +323,46 @@ pub async fn process_chat_sse<S>(
             }
 
             if finish_reason == Some("tool_calls") {
+                // 发送包含tool_calls的assistant消息
+                if let Some(mut assistant) = assistant_item.take() {
+                    // 为assistant消息添加tool_calls信息
+                    if let ResponseItem::Message {
+                        tool_calls: ref mut msg_tool_calls,
+                        ..
+                    } = assistant
+                    {
+                        let mut calls = Vec::new();
+                        for index in &tool_call_order {
+                            if let Some(state) = tool_calls.get(index) {
+                                if let (Some(id), Some(name)) = (&state.id, &state.name) {
+                                    calls.push(serde_json::json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": &state.arguments
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                        if !calls.is_empty() {
+                            *msg_tool_calls = Some(calls);
+                        }
+                    }
+                    let _ = tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(assistant)))
+                        .await;
+                }
+
+                // 发送reasoning（如果有的话）
                 if let Some(reasoning) = reasoning_item.take() {
                     let _ = tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(reasoning)))
                         .await;
                 }
 
+                // 发送工具调用
                 for index in tool_call_order.drain(..) {
                     let Some(state) = tool_calls.remove(&index) else {
                         continue;
@@ -322,11 +395,16 @@ async fn append_assistant_text(
     assistant_item: &mut Option<ResponseItem>,
     text: String,
 ) {
+    // Filter out DeepSeek special tokens that shouldn't be displayed to users
+    let filtered_text = filter_deepseek_special_tokens(&text);
+
     if assistant_item.is_none() {
         let item = ResponseItem::Message {
             id: None,
             role: "assistant".to_string(),
             content: vec![],
+            reasoning_content: None, // Will be set later if available
+            tool_calls: None,
         };
         *assistant_item = Some(item.clone());
         let _ = tx_event
@@ -335,9 +413,11 @@ async fn append_assistant_text(
     }
 
     if let Some(ResponseItem::Message { content, .. }) = assistant_item {
-        content.push(ContentItem::OutputText { text: text.clone() });
+        content.push(ContentItem::OutputText {
+            text: filtered_text.clone(),
+        });
         let _ = tx_event
-            .send(Ok(ResponseEvent::OutputTextDelta(text.clone())))
+            .send(Ok(ResponseEvent::OutputTextDelta(filtered_text.clone())))
             .await;
     }
 }
@@ -347,6 +427,9 @@ async fn append_reasoning_text(
     reasoning_item: &mut Option<ResponseItem>,
     text: String,
 ) {
+    // Filter out DeepSeek special tokens that shouldn't be displayed to users
+    let filtered_text = filter_deepseek_special_tokens(&text);
+
     if reasoning_item.is_none() {
         let item = ResponseItem::Reasoning {
             id: String::new(),
@@ -366,15 +449,26 @@ async fn append_reasoning_text(
     }) = reasoning_item
     {
         let content_index = content.len() as i64;
-        content.push(ReasoningItemContent::ReasoningText { text: text.clone() });
+        content.push(ReasoningItemContent::ReasoningText {
+            text: filtered_text.clone(),
+        });
 
         let _ = tx_event
             .send(Ok(ResponseEvent::ReasoningContentDelta {
-                delta: text.clone(),
+                delta: filtered_text.clone(),
                 content_index,
             }))
             .await;
     }
+}
+
+/// Filters out DeepSeek special tokens that shouldn't be displayed to users.
+/// These tokens are used internally by the model but are not part of the actual response content.
+fn filter_deepseek_special_tokens(text: &str) -> String {
+    // Remove DeepSeek special tokens
+    text.replace("<｜end▁of▁thinking｜>", "")
+        .replace("<｜begin▁of▁thinking｜>", "")
+    // Add other DeepSeek special tokens here as they are discovered
 }
 
 #[cfg(test)]

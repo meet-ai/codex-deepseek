@@ -646,7 +646,7 @@ async fn includes_user_instructions_message_in_request() {
             .unwrap()
             .contains("be nice")
     );
-    assert_message_role(&request_body["input"][0], "developer");
+    assert_message_role(&request_body["input"][0], "user");
     let permissions_text = request_body["input"][0]["content"][0]["text"]
         .as_str()
         .expect("invalid permissions message content");
@@ -719,7 +719,7 @@ async fn skills_append_to_instructions() {
     let request = resp_mock.single_request();
     let request_body = request.body_json();
 
-    assert_message_role(&request_body["input"][0], "developer");
+    assert_message_role(&request_body["input"][0], "user");
 
     assert_message_role(&request_body["input"][1], "user");
     let instructions_text = request_body["input"][1]["content"][0]["text"]
@@ -1098,7 +1098,7 @@ async fn includes_developer_instructions_message_in_request() {
             .unwrap()
             .contains("be nice")
     );
-    assert_message_role(&request_body["input"][0], "developer");
+    assert_message_role(&request_body["input"][0], "user");
     assert!(
         permissions_text.contains("`sandbox_mode`"),
         "expected permissions message to mention sandbox_mode, got {permissions_text:?}"

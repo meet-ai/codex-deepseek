@@ -51,6 +51,9 @@ impl ToolCallRuntime {
         call: ToolCall,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+        let call_id = call.call_id.clone();
+        let tool_name = call.tool_name.clone();
+        tracing::warn!("⚙️ 开始执行工具调用: {} (call_id: {})", tool_name, call_id);
         let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
 
         let router = Arc::clone(&self.router);
@@ -93,12 +96,24 @@ impl ToolCallRuntime {
 
         async move {
             match handle.await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
-                Err(err) => Err(CodexErr::Fatal(format!(
-                    "tool task failed to receive: {err:?}"
-                ))),
+                Ok(Ok(response)) => {
+                    tracing::warn!("✅ 工具调用完成: {} (call_id: {}) 返回结果", tool_name, call_id);
+                    Ok(response)
+                }
+                Ok(Err(FunctionCallError::Fatal(message))) => {
+                    tracing::warn!("💥 工具调用失败: {} (call_id: {}) 致命错误: {}", tool_name, call_id, message);
+                    Err(CodexErr::Fatal(message))
+                }
+                Ok(Err(other)) => {
+                    tracing::warn!("❌ 工具调用失败: {} (call_id: {}) 错误: {:?}", tool_name, call_id, other);
+                    Err(CodexErr::Fatal(other.to_string()))
+                }
+                Err(err) => {
+                    tracing::warn!("💥 工具调用系统错误: {} (call_id: {}) 任务接收失败: {:?}", tool_name, call_id, err);
+                    Err(CodexErr::Fatal(format!(
+                        "tool task failed to receive: {err:?}"
+                    )))
+                }
             }
         }
         .in_current_span()

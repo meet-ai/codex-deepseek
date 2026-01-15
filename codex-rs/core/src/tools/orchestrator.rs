@@ -57,12 +57,29 @@ impl ToolOrchestrator {
         });
         match requirement {
             ExecApprovalRequirement::Skip { .. } => {
+                tracing::warn!(
+                    "✅ 工具 {} (call_id: {}) 跳过审批 - 自动批准",
+                    otel_tn,
+                    otel_ci
+                );
                 otel.tool_decision(otel_tn, otel_ci, &ReviewDecision::Approved, otel_cfg);
             }
             ExecApprovalRequirement::Forbidden { reason } => {
+                tracing::warn!(
+                    "❌ 工具 {} (call_id: {}) 被禁止执行: {}",
+                    otel_tn,
+                    otel_ci,
+                    reason
+                );
                 return Err(ToolError::Rejected(reason));
             }
             ExecApprovalRequirement::NeedsApproval { reason, .. } => {
+                tracing::warn!(
+                    "⏳ 工具 {} (call_id: {}) 等待用户审批: {:?}",
+                    otel_tn,
+                    otel_ci,
+                    reason
+                );
                 let approval_ctx = ApprovalCtx {
                     session: tool_ctx.session,
                     turn: turn_ctx,
@@ -75,11 +92,14 @@ impl ToolOrchestrator {
 
                 match decision {
                     ReviewDecision::Denied | ReviewDecision::Abort => {
+                        tracing::warn!("❌ 工具 {} (call_id: {}) 被用户拒绝", otel_tn, otel_ci);
                         return Err(ToolError::Rejected("rejected by user".to_string()));
                     }
                     ReviewDecision::Approved
                     | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                    | ReviewDecision::ApprovedForSession => {}
+                    | ReviewDecision::ApprovedForSession => {
+                        tracing::warn!("✅ 工具 {} (call_id: {}) 获得用户批准", otel_tn, otel_ci);
+                    }
                 }
                 already_approved = true;
             }
@@ -103,13 +123,31 @@ impl ToolOrchestrator {
             codex_linux_sandbox_exe: turn_ctx.codex_linux_sandbox_exe.as_ref(),
         };
 
+        tracing::warn!(
+            "🚀 开始执行工具 {} (call_id: {}) 使用沙箱: {:?}",
+            otel_tn,
+            otel_ci,
+            initial_sandbox
+        );
         match tool.run(req, &initial_attempt, tool_ctx).await {
             Ok(out) => {
+                tracing::warn!("✅ 工具 {} (call_id: {}) 执行成功", otel_tn, otel_ci);
                 // We have a successful initial result
                 Ok(out)
             }
             Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output }))) => {
+                tracing::warn!(
+                    "⚠️ 工具 {} (call_id: {}) 沙箱拒绝: {:?}",
+                    otel_tn,
+                    otel_ci,
+                    output
+                );
                 if !tool.escalate_on_failure() {
+                    tracing::warn!(
+                        "❌ 工具 {} (call_id: {}) 不支持升级，不重试",
+                        otel_tn,
+                        otel_ci
+                    );
                     return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                         output,
                     })));
@@ -137,11 +175,22 @@ impl ToolOrchestrator {
 
                     match decision {
                         ReviewDecision::Denied | ReviewDecision::Abort => {
+                            tracing::warn!(
+                                "❌ 工具 {} (call_id: {}) 重试被用户拒绝",
+                                otel_tn,
+                                otel_ci
+                            );
                             return Err(ToolError::Rejected("rejected by user".to_string()));
                         }
                         ReviewDecision::Approved
                         | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                        | ReviewDecision::ApprovedForSession => {}
+                        | ReviewDecision::ApprovedForSession => {
+                            tracing::warn!(
+                                "✅ 工具 {} (call_id: {}) 重试获得批准",
+                                otel_tn,
+                                otel_ci
+                            );
+                        }
                     }
                 }
 
@@ -154,7 +203,26 @@ impl ToolOrchestrator {
                 };
 
                 // Second attempt.
-                (*tool).run(req, &escalated_attempt, tool_ctx).await
+                tracing::warn!(
+                    "🔄 重试工具 {} (call_id: {}) - 不使用沙箱",
+                    otel_tn,
+                    otel_ci
+                );
+                match (*tool).run(req, &escalated_attempt, tool_ctx).await {
+                    Ok(out) => {
+                        tracing::warn!("✅ 工具 {} (call_id: {}) 重试成功", otel_tn, otel_ci);
+                        Ok(out)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "❌ 工具 {} (call_id: {}) 重试失败: {:?}",
+                            otel_tn,
+                            otel_ci,
+                            e
+                        );
+                        Err(e)
+                    }
+                }
             }
             other => other,
         }

@@ -38,6 +38,8 @@ impl From<UserInstructions> for ResponseItem {
                     contents = ui.text
                 ),
             }],
+            reasoning_content: None,
+            tool_calls: None,
         }
     }
 }
@@ -71,6 +73,8 @@ impl From<SkillInstructions> for ResponseItem {
                     si.name, si.path, si.contents
                 ),
             }],
+            reasoning_content: None,
+            tool_calls: None,
         }
     }
 }

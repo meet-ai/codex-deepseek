@@ -385,7 +385,7 @@ async fn codex_tool_passes_base_instructions() -> anyhow::Result<()> {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|msg| msg.get("role").and_then(|role| role.as_str()) == Some("developer"))
+        .filter(|msg| msg.get("role").and_then(|role| role.as_str()) == Some("user"))
         .collect();
     let developer_contents: Vec<&str> = developer_messages
         .iter()

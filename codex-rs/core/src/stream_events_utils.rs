@@ -51,7 +51,12 @@ pub(crate) async fn handle_output_item_done(
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
             let payload_preview = call.payload.log_payload().into_owned();
-            tracing::info!("ToolCall: {} {}", call.tool_name, payload_preview);
+            tracing::warn!(
+                "🔧 工具调用: {} {} (call_id: {})",
+                call.tool_name,
+                payload_preview,
+                call.call_id
+            );
 
             ctx.sess
                 .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
@@ -69,6 +74,16 @@ pub(crate) async fn handle_output_item_done(
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {
+            // 处理DeepSeek reasoning_content
+            if let ResponseItem::Message { role, reasoning_content, .. } = &item {
+                if role == "assistant" {
+                    if let Some(reasoning) = reasoning_content {
+                        tracing::warn!("🧠 存储DeepSeek reasoning_content到session (长度: {})", reasoning.len());
+                        ctx.sess.set_reasoning_content(reasoning.clone()).await;
+                    }
+                }
+            }
+
             if let Some(turn_item) = handle_non_tool_response_item(&item).await {
                 if previously_active_item.is_none() {
                     ctx.sess
@@ -154,9 +169,87 @@ pub(crate) async fn handle_non_tool_response_item(item: &ResponseItem) -> Option
     debug!(?item, "Output item");
 
     match item {
-        ResponseItem::Message { .. }
-        | ResponseItem::Reasoning { .. }
-        | ResponseItem::WebSearchCall { .. } => parse_turn_item(item),
+        ResponseItem::Message { content, role, reasoning_content, .. } => {
+            // 记录助手消息内容
+            let message_text = content
+                .iter()
+                .filter_map(|ci| match ci {
+                    codex_protocol::models::ContentItem::OutputText { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !message_text.is_empty() && message_text.len() > 50 {
+                tracing::warn!("💭 助手回复: {}...", &message_text[..50]);
+            } else if !message_text.is_empty() {
+                tracing::warn!("💭 助手回复: {}", message_text);
+            }
+
+            // 处理DeepSeek reasoning_content
+            if role == "assistant" {
+                if let Some(reasoning) = reasoning_content {
+                    tracing::warn!("🧠 存储DeepSeek reasoning_content (长度: {})", reasoning.len());
+                    // 这里我们需要访问session来存储reasoning_content
+                    // 但这个函数没有session参数，所以我们需要在调用处处理
+                }
+            }
+
+            parse_turn_item(item)
+        }
+        ResponseItem::Reasoning { content, .. } => {
+            // 记录推理过程
+            if let Some(content_items) = content {
+                let reasoning_parts: Vec<String> = content_items
+                    .iter()
+                    .filter_map(|ci| match ci {
+                        codex_protocol::models::ReasoningItemContent::ReasoningText { text } => {
+                            Some(format!("推理: {}", text))
+                        }
+                        codex_protocol::models::ReasoningItemContent::Text { text } => {
+                            Some(format!("文本: {}", text))
+                        }
+                    })
+                    .collect();
+
+                tracing::warn!("🧠 LLM 推理内容: {} 个片段", reasoning_parts.len());
+
+                for (i, part) in reasoning_parts.iter().enumerate() {
+                    if part.len() > 200 {
+                        tracing::warn!("🧠 推理片段 {}: {}...", i + 1, &part[..200]);
+                    } else {
+                        tracing::warn!("🧠 推理片段 {}: {}", i + 1, part);
+                    }
+                }
+            }
+            parse_turn_item(item)
+        }
+        ResponseItem::WebSearchCall { action, .. } => {
+            match action {
+                codex_protocol::models::WebSearchAction::Search { query } => {
+                    if let Some(q) = query {
+                        tracing::warn!("🔍 网络搜索: {}", q);
+                    }
+                }
+                codex_protocol::models::WebSearchAction::OpenPage { url } => {
+                    if let Some(u) = url {
+                        tracing::warn!("🔗 打开网页: {}", u);
+                    }
+                }
+                codex_protocol::models::WebSearchAction::FindInPage { url, pattern } => {
+                    if let Some(u) = url {
+                        if let Some(p) = pattern {
+                            tracing::warn!("🔍 在页面中查找: {} -> {}", u, p);
+                        } else {
+                            tracing::warn!("🔍 访问页面: {}", u);
+                        }
+                    }
+                }
+                codex_protocol::models::WebSearchAction::Other => {
+                    tracing::warn!("🔍 其他网络操作");
+                }
+            }
+            parse_turn_item(item)
+        }
         ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
             debug!("unexpected tool output from stream");
             None

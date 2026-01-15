@@ -453,7 +453,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
         .iter()
         .filter_map(|msg| {
             let role = msg["role"].as_str()?;
-            if role != "developer" {
+            if role != "user" {
                 return None;
             }
             msg["content"]

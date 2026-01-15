@@ -26,6 +26,8 @@ pub struct Prompt {
     /// Whether parallel tool calls are permitted.
     pub parallel_tool_calls: bool,
     /// Optional output schema used to build the `text.format` controls.
+    /// For DeepSeek thinking mode, reasoning_content from previous assistant messages
+    pub reasoning_content: Option<String>,
     pub output_schema: Option<Value>,
 }
 

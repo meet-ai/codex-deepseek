@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_protocol::models::ShellToolCallParams;
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::codex::TurnContext;
@@ -17,7 +18,6 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use crate::tools::runtimes::shell::ShellRequest;
@@ -29,6 +29,27 @@ pub struct ShellHandler;
 pub struct ShellCommandHandler;
 
 impl ShellHandler {
+    /// 专门为shell工具解析参数，提供智能错误信息
+    pub fn parse_shell_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        serde_json::from_str(arguments).map_err(|err| {
+            let error_msg = err.to_string();
+            let helpful_msg = if error_msg.contains("expected a sequence") {
+                format!(
+                    "解析shell工具参数失败: {err}\n\n\
+                    提示: shell工具的command参数应该是JSON数组格式，例如：\n\
+                    {{\"command\": [\"bash\", \"-lc\", \"pwd && ls -la\"], \"workdir\": \"/path/to/dir\"}}\n\
+                    而不是字符串格式：{{\"command\": \"pwd\", \"workdir\": \"/path/to/dir\"}}"
+                )
+            } else {
+                format!("failed to parse shell function arguments: {err}")
+            };
+            FunctionCallError::RespondToModel(helpful_msg)
+        })
+    }
+
     fn to_exec_params(params: ShellToolCallParams, turn_context: &TurnContext) -> ExecParams {
         ExecParams {
             command: params.command,
@@ -84,9 +105,10 @@ impl ToolHandler for ShellHandler {
     async fn is_mutating(&self, invocation: &ToolInvocation) -> bool {
         match &invocation.payload {
             ToolPayload::Function { arguments } => {
-                serde_json::from_str::<ShellToolCallParams>(arguments)
-                    .map(|params| !is_known_safe_command(&params.command))
-                    .unwrap_or(true)
+                match serde_json::from_str::<ShellToolCallParams>(arguments) {
+                    Ok(params) => !is_known_safe_command(&params.command),
+                    Err(_) => true, // 如果参数格式错误，假设是可变的（安全起见）
+                }
             }
             ToolPayload::LocalShell { params } => !is_known_safe_command(&params.command),
             _ => true, // unknown payloads => assume mutating
@@ -105,7 +127,7 @@ impl ToolHandler for ShellHandler {
 
         match payload {
             ToolPayload::Function { arguments } => {
-                let params: ShellToolCallParams = parse_arguments(&arguments)?;
+                let params: ShellToolCallParams = Self::parse_shell_arguments(&arguments)?;
                 let exec_params = Self::to_exec_params(params, turn.as_ref());
                 Self::run_exec_like(
                     tool_name.as_str(),
@@ -266,7 +288,7 @@ impl ShellHandler {
             justification: exec_params.justification.clone(),
             exec_approval_requirement,
         };
-        let mut orchestrator = ToolOrchestrator::new();
+        let mut orchestrator = crate::tools::orchestrator::ToolOrchestrator::new();
         let mut runtime = ShellRuntime::new();
         let tool_ctx = ToolCtx {
             session: session.as_ref(),
@@ -292,8 +314,30 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use crate::function_tool::FunctionCallError;
     use codex_protocol::models::ShellCommandToolCallParams;
+    use codex_protocol::models::ShellToolCallParams;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_parse_shell_arguments_error_message() {
+        // 测试错误的参数格式是否返回智能错误信息
+        let invalid_args = r#"{"command": "pwd", "workdir": "/tmp"}"#;
+
+        // 创建一个ShellHandler实例来调用方法
+        let handler = ShellHandler;
+        let result: Result<ShellToolCallParams, _> = handler.parse_shell_arguments(invalid_args);
+        assert!(result.is_err());
+
+        if let Err(FunctionCallError::RespondToModel(msg)) = result {
+            println!("错误信息: {}", msg);
+            assert!(msg.contains("解析shell工具参数失败"));
+            assert!(msg.contains("JSON数组格式"));
+            assert!(msg.contains("而不是字符串格式"));
+        } else {
+            panic!("期望RespondToModel错误");
+        }
+    }
 
     use crate::codex::make_session_and_context;
     use crate::exec_env::create_env;

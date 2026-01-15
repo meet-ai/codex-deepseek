@@ -34,6 +34,9 @@ pub struct Prompt {
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
 
+    /// For DeepSeek thinking mode, reasoning_content from previous assistant messages
+    pub(crate) reasoning_content: Option<String>,
+
     /// Optional override for the built-in BASE_INSTRUCTIONS.
     pub base_instructions_override: Option<String>,
 

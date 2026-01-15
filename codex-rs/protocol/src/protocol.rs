@@ -1361,6 +1361,8 @@ impl From<CompactedItem> for ResponseItem {
             content: vec![ContentItem::OutputText {
                 text: value.message,
             }],
+            reasoning_content: None,
+            tool_calls: None,
         }
     }
 }

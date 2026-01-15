@@ -1343,9 +1343,21 @@ impl Session {
             content: vec![ContentItem::InputText {
                 text: format!("Warning: {}", message.into()),
             }],
+            reasoning_content: None,
+            tool_calls: None,
         };
 
         self.record_conversation_items(ctx, &[item]).await;
+    }
+
+    pub(crate) async fn set_reasoning_content(&self, reasoning_content: String) {
+        let mut state = self.state.lock().await;
+        state.set_reasoning_content(reasoning_content);
+    }
+
+    pub(crate) async fn get_reasoning_content(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state.get_reasoning_content().map(|s| s.to_string())
     }
 
     pub(crate) async fn replace_history(&self, items: Vec<ResponseItem>) {
@@ -1799,11 +1811,19 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     let mut previous_context: Option<Arc<TurnContext>> = Some(sess.new_default_turn().await);
 
     // To break out of this loop, send Op::Shutdown.
+    info!(
+        "Submission loop started for session {}",
+        sess.conversation_id
+    );
     while let Ok(sub) = rx_sub.recv().await {
-        debug!(?sub, "Submission");
+        let start_time = std::time::Instant::now();
+        debug!(submission_id = %sub.id, op_type = ?sub.op, "Received submission");
+
         match sub.op.clone() {
             Op::Interrupt => {
+                info!(submission_id = %sub.id, "Handling interrupt request");
                 handlers::interrupt(&sess).await;
+                debug!(submission_id = %sub.id, duration_ms = start_time.elapsed().as_millis(), "Interrupt handling completed");
             }
             Op::OverrideTurnContext {
                 cwd,
@@ -1813,6 +1833,16 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 effort,
                 summary,
             } => {
+                info!(
+                    submission_id = %sub.id,
+                    ?cwd,
+                    ?approval_policy,
+                    ?sandbox_policy,
+                    ?model,
+                    ?effort,
+                    ?summary,
+                    "Handling turn context override"
+                );
                 handlers::override_turn_context(
                     &sess,
                     sub.id.clone(),
@@ -1827,16 +1857,23 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     },
                 )
                 .await;
+                debug!(submission_id = %sub.id, duration_ms = start_time.elapsed().as_millis(), "Turn context override completed");
             }
             Op::UserInput { .. } | Op::UserTurn { .. } => {
+                info!(submission_id = %sub.id, op_type = ?sub.op, "Processing user input/turn");
                 handlers::user_input_or_turn(&sess, sub.id.clone(), sub.op, &mut previous_context)
                     .await;
+                info!(submission_id = %sub.id, duration_ms = start_time.elapsed().as_millis(), "User input/turn processing completed");
             }
             Op::ExecApproval { id, decision } => {
+                info!(submission_id = %sub.id, approval_id = %id, ?decision, "Processing execution approval");
                 handlers::exec_approval(&sess, id, decision).await;
+                debug!(submission_id = %sub.id, duration_ms = start_time.elapsed().as_millis(), "Execution approval processed");
             }
             Op::PatchApproval { id, decision } => {
+                info!(submission_id = %sub.id, approval_id = %id, ?decision, "Processing patch approval");
                 handlers::patch_approval(&sess, id, decision).await;
+                debug!(submission_id = %sub.id, duration_ms = start_time.elapsed().as_millis(), "Patch approval processed");
             }
             Op::AddToHistory { text } => {
                 handlers::add_to_history(&sess, &config, text).await;
@@ -1935,6 +1972,7 @@ mod handlers {
     use mcp_types::RequestId;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use tracing::debug;
     use tracing::info;
     use tracing::warn;
 
@@ -1965,6 +2003,8 @@ mod handlers {
         op: Op,
         previous_context: &mut Option<Arc<TurnContext>>,
     ) {
+        info!(submission_id = %sub_id, "Starting user input/turn processing");
+        let handler_start = std::time::Instant::now();
         let (items, updates) = match op {
             Op::UserTurn {
                 cwd,
@@ -2000,16 +2040,19 @@ mod handlers {
             _ => unreachable!(),
         };
 
-        let Ok(current_context) = sess.new_turn_with_sub_id(sub_id, updates).await else {
+        let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
+            warn!(submission_id = %sub_id, "Failed to create new turn context");
             // new_turn_with_sub_id already emits the error event.
             return;
         };
+        info!(submission_id = %sub_id, "Created new turn context");
         current_context
             .client
             .get_otel_manager()
             .user_prompt(&items);
 
         // Attempt to inject input into current task
+        debug!(submission_id = %sub_id, items_count = items.len(), "Attempting to inject input into current task");
         if let Err(items) = sess.inject_input(items).await {
             let mut update_items = Vec::new();
             if let Some(env_item) =
@@ -2027,11 +2070,16 @@ mod handlers {
                     .await;
             }
 
+            debug!(submission_id = %sub_id, "Input injection failed, spawning new task");
             sess.refresh_mcp_servers_if_requested(&current_context)
                 .await;
+            info!(submission_id = %sub_id, remaining_items = items.len(), "Spawning new regular task");
             sess.spawn_task(Arc::clone(&current_context), items, RegularTask)
                 .await;
             *previous_context = Some(current_context);
+            info!(submission_id = %sub_id, duration_ms = handler_start.elapsed().as_millis(), "User input/turn handler completed");
+        } else {
+            debug!(submission_id = %sub_id, "Input successfully injected into existing task");
         }
     }
 
@@ -2568,6 +2616,7 @@ pub(crate) async fn run_turn(
             .into_iter()
             .map(ResponseItem::from)
             .collect::<Vec<ResponseItem>>();
+        tracing::warn!("🔍 Turn开始 - pending_input数量: {}", pending_input.len());
 
         // Construct the input that we will send to the model.
         let turn_input: Vec<ResponseItem> = {
@@ -2575,6 +2624,11 @@ pub(crate) async fn run_turn(
                 .await;
             sess.clone_history().await.for_prompt()
         };
+        tracing::warn!(
+            "🔍 Turn输入 - turn_input长度: {}, pending_input长度: {}",
+            turn_input.len(),
+            pending_input.len()
+        );
 
         let turn_input_messages = turn_input
             .iter()
@@ -2584,6 +2638,53 @@ pub(crate) async fn run_turn(
             })
             .map(|user_message| user_message.message())
             .collect::<Vec<String>>();
+
+        // 调试：显示turn_input的详细内容
+        tracing::warn!("🔍 Turn Input 详细内容:");
+        for (i, item) in turn_input.iter().enumerate() {
+            match item {
+                ResponseItem::Message { role, content, .. } => {
+                    let content_text = content
+                        .iter()
+                        .map(|c| match c {
+                            codex_protocol::models::ContentItem::OutputText { text } => text.len(),
+                            _ => 0,
+                        })
+                        .sum::<usize>();
+                    tracing::warn!(
+                        "  [{}] Message role={} content_len={}",
+                        i,
+                        role,
+                        content_text
+                    );
+                }
+                ResponseItem::FunctionCall {
+                    name, arguments, ..
+                } => {
+                    tracing::warn!(
+                        "  [{}] FunctionCall name={} args_len={}",
+                        i,
+                        name,
+                        arguments.len()
+                    );
+                }
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } => {
+                    tracing::warn!(
+                        "  [{}] FunctionCallOutput call_id={} output_len={}",
+                        i,
+                        call_id,
+                        output.content.len()
+                    );
+                }
+                other => {
+                    tracing::warn!("  [{}] {:?}", i, std::mem::discriminant(other));
+                }
+            }
+        }
+        tracing::warn!("🔍 Turn Input Messages: {:?}", turn_input_messages);
+        tracing::warn!("🚀 开始执行run_model_turn");
         match run_model_turn(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -2595,6 +2696,7 @@ pub(crate) async fn run_turn(
         .await
         {
             Ok(turn_output) => {
+                tracing::warn!("✅ run_model_turn执行完成");
                 let TurnRunResult {
                     needs_follow_up,
                     last_agent_message: turn_last_agent_message,
@@ -2634,7 +2736,7 @@ pub(crate) async fn run_turn(
                 state.history.replace_last_turn_images("Invalid image");
             }
             Err(e) => {
-                info!("Turn error: {e:#}");
+                tracing::warn!("❌ run_model_turn执行失败: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(None));
                 sess.send_event(&turn_context, event).await;
                 // let the user continue the conversation
@@ -2693,16 +2795,28 @@ async fn run_model_turn(
         .get_model_info()
         .supports_parallel_tool_calls;
 
+    let reasoning_content = sess
+        .state
+        .lock()
+        .await
+        .get_reasoning_content()
+        .map(|s| s.to_string());
+    if reasoning_content.is_some() {
+        tracing::warn!("🧠 使用存储的DeepSeek reasoning_content");
+    }
+
     let prompt = Prompt {
         input,
         tools: router.specs(),
         parallel_tool_calls: model_supports_parallel,
         base_instructions_override: turn_context.base_instructions.clone(),
         output_schema: turn_context.final_output_json_schema.clone(),
+        reasoning_content,
     };
 
     let mut retries = 0;
     loop {
+        tracing::warn!("🔄 调用try_run_turn (重试次数: {})", retries);
         let err = match try_run_turn(
             Arc::clone(&router),
             Arc::clone(&sess),
@@ -2714,20 +2828,30 @@ async fn run_model_turn(
         )
         .await
         {
-            Ok(output) => return Ok(output),
-            Err(CodexErr::ContextWindowExceeded) => {
+            Ok(output) => {
+                tracing::warn!("✅ try_run_turn成功返回");
+                return Ok(output);
+            }
+            Err(err) => {
+                tracing::warn!("❌ try_run_turn返回错误: {:?}", err);
+                err
+            }
+        };
+
+        match err {
+            CodexErr::ContextWindowExceeded => {
                 sess.set_total_tokens_full(&turn_context).await;
                 return Err(CodexErr::ContextWindowExceeded);
             }
-            Err(CodexErr::UsageLimitReached(e)) => {
+            CodexErr::UsageLimitReached(e) => {
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, rate_limits).await;
                 }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(err) => err,
-        };
+            _ => {} // 对于其他错误，继续下面的重试逻辑
+        }
 
         if !err.is_retryable() {
             return Err(err);
@@ -2773,16 +2897,30 @@ async fn drain_in_flight(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
+    tracing::warn!("🔄 开始处理 {} 个待处理的工具调用结果", in_flight.len());
+    let mut processed_count = 0;
+
     while let Some(res) = in_flight.next().await {
+        processed_count += 1;
         match res {
             Ok(response_input) => {
+                tracing::warn!(
+                    "📝 记录工具调用结果 #{}: {:?}",
+                    processed_count,
+                    response_input
+                );
                 sess.record_conversation_items(&turn_context, &[response_input.into()])
                     .await;
             }
             Err(err) => {
+                tracing::warn!("❌ 工具调用结果 #{} 处理失败: {}", processed_count, err);
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
         }
+    }
+
+    if processed_count > 0 {
+        tracing::warn!("✅ 完成处理 {} 个工具调用结果", processed_count);
     }
     Ok(())
 }
@@ -2847,6 +2985,7 @@ async fn try_run_turn(
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
     let receiving_span = trace_span!("receiving_stream");
+    tracing::warn!("🔄 开始处理LLM响应流");
     let outcome: CodexResult<TurnRunResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
@@ -2856,19 +2995,33 @@ async fn try_run_turn(
             from = field::Empty,
         );
 
+        tracing::warn!("🔄 等待LLM响应事件...");
         let event = match stream
             .next()
             .instrument(trace_span!(parent: &handle_responses, "receiving"))
             .or_cancel(&cancellation_token)
             .await
         {
-            Ok(event) => event,
-            Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
+            Ok(event) => {
+                tracing::warn!(
+                    "📨 收到stream.next()结果: {:?}",
+                    event.as_ref().map(|e| std::mem::discriminant(e))
+                );
+                event
+            }
+            Err(codex_async_utils::CancelErr::Cancelled) => {
+                tracing::warn!("❌ 收到取消信号，终止turn");
+                break Err(CodexErr::TurnAborted);
+            }
         };
 
         let event = match event {
-            Some(res) => res?,
+            Some(res) => {
+                tracing::warn!("📨 收到LLM响应事件: {:?}", std::mem::discriminant(&res));
+                res?
+            }
             None => {
+                tracing::warn!("❌ LLM响应流意外关闭");
                 break Err(CodexErr::Stream(
                     "stream closed before response.completed".into(),
                     None,
@@ -2881,7 +3034,9 @@ async fn try_run_turn(
             .record_responses(&handle_responses, &event);
 
         match event {
-            ResponseEvent::Created => {}
+            ResponseEvent::Created => {
+                tracing::warn!("📡 LLM 响应流开始 - 会话: {}", sess.conversation_id);
+            }
             ResponseEvent::OutputItemDone(item) => {
                 let previously_active_item = active_item.take();
                 let mut ctx = HandleOutputCtx {
@@ -2927,12 +3082,42 @@ async fn try_run_turn(
                 response_id: _,
                 token_usage,
             } => {
+                if let Some(usage) = token_usage.as_ref() {
+                    tracing::warn!(
+                        "✅ LLM 响应完成 - 输入token: {} 输出token: {} 总token: {}",
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.total_tokens
+                    );
+                } else {
+                    tracing::warn!("✅ LLM 响应完成 - token 使用信息不可用");
+                }
                 sess.update_token_usage_info(&turn_context, token_usage.as_ref())
                     .await;
                 should_emit_turn_diff = true;
 
-                needs_follow_up |= sess.has_pending_input().await;
-                error!("needs_follow_up: {needs_follow_up}");
+                let has_pending = sess.has_pending_input().await;
+                // 检查这个响应是否包含工具调用
+                // 如果LLM刚刚发出了工具调用，那么这个响应是"工具调用响应"，应该继续等待最终响应
+                // 如果LLM没有发出工具调用，那么这个响应是"最终响应"，可以结束turn
+                let response_has_tool_calls = !in_flight.is_empty();
+                tracing::warn!(
+                    "🔍 Completed事件 - 响应包含工具调用: {}, has_pending_input: {}",
+                    response_has_tool_calls,
+                    has_pending
+                );
+
+                if !has_pending && !response_has_tool_calls {
+                    needs_follow_up = false;
+                    tracing::warn!("🔍 Completed事件 - 最终响应完成，无待处理输入，结束turn");
+                } else {
+                    needs_follow_up |= has_pending || response_has_tool_calls;
+                }
+                tracing::warn!(
+                    "🔍 Completed事件 - has_pending_input: {}, needs_follow_up: {}",
+                    has_pending,
+                    needs_follow_up
+                );
 
                 break Ok(TurnRunResult {
                     needs_follow_up,

@@ -67,46 +67,77 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
-                if let Some((server, tool)) = session.parse_mcp_tool_name(&name).await {
-                    Ok(Some(ToolCall {
-                        tool_name: name,
-                        call_id,
-                        payload: ToolPayload::Mcp {
+                let tool_call =
+                    if let Some((server, tool)) = session.parse_mcp_tool_name(&name).await {
+                        tracing::warn!(
+                            "🔍 解析工具调用: MCP工具 {} -> 服务器: {} 工具: {} (call_id: {})",
+                            name,
                             server,
                             tool,
-                            raw_arguments: arguments,
-                        },
-                    }))
-                } else {
-                    Ok(Some(ToolCall {
-                        tool_name: name,
-                        call_id,
-                        payload: ToolPayload::Function { arguments },
-                    }))
-                }
+                            call_id
+                        );
+                        ToolCall {
+                            tool_name: name,
+                            call_id,
+                            payload: ToolPayload::Mcp {
+                                server,
+                                tool,
+                                raw_arguments: arguments,
+                            },
+                        }
+                    } else {
+                        tracing::warn!(
+                            "🔍 解析工具调用: 函数工具 {} (call_id: {}) 参数内容: {} (长度: {})",
+                            name,
+                            call_id,
+                            arguments,
+                            arguments.to_string().len()
+                        );
+                        ToolCall {
+                            tool_name: name,
+                            call_id,
+                            payload: ToolPayload::Function { arguments },
+                        }
+                    };
+                Ok(Some(tool_call))
             }
             ResponseItem::CustomToolCall {
                 name,
                 input,
                 call_id,
                 ..
-            } => Ok(Some(ToolCall {
-                tool_name: name,
-                call_id,
-                payload: ToolPayload::Custom { input },
-            })),
+            } => {
+                tracing::warn!(
+                    "🔍 解析工具调用: 自定义工具 {} (call_id: {}) 输入长度: {}",
+                    name,
+                    call_id,
+                    input.to_string().len()
+                );
+                Ok(Some(ToolCall {
+                    tool_name: name,
+                    call_id,
+                    payload: ToolPayload::Custom { input },
+                }))
+            }
             ResponseItem::LocalShellCall {
                 id,
                 call_id,
                 action,
                 ..
             } => {
-                let call_id = call_id
+                let final_call_id = call_id
                     .or(id)
                     .ok_or(FunctionCallError::MissingLocalShellCallId)?;
 
                 match action {
                     LocalShellAction::Exec(exec) => {
+                        tracing::warn!(
+                            "🔍 解析工具调用: 本地Shell命令 {} (call_id: {}) 命令: {} 工作目录: {:?}",
+                            "local_shell",
+                            final_call_id,
+                            exec.command.join(" "),
+                            exec.working_directory
+                        );
                         let params = ShellToolCallParams {
                             command: exec.command,
                             workdir: exec.working_directory,
@@ -116,7 +147,7 @@ impl ToolRouter {
                         };
                         Ok(Some(ToolCall {
                             tool_name: "local_shell".to_string(),
-                            call_id,
+                            call_id: final_call_id,
                             payload: ToolPayload::LocalShell { params },
                         }))
                     }
@@ -141,6 +172,7 @@ impl ToolRouter {
         } = call;
         let payload_outputs_custom = matches!(payload, ToolPayload::Custom { .. });
         let failure_call_id = call_id.clone();
+        let tool_name_clone = tool_name.clone();
 
         let invocation = ToolInvocation {
             session,
@@ -151,14 +183,42 @@ impl ToolRouter {
             payload,
         };
 
+        tracing::warn!(
+            "📤 分发工具调用: {} (call_id: {})",
+            tool_name_clone,
+            failure_call_id
+        );
         match self.registry.dispatch(invocation).await {
-            Ok(response) => Ok(response),
-            Err(FunctionCallError::Fatal(message)) => Err(FunctionCallError::Fatal(message)),
-            Err(err) => Ok(Self::failure_response(
-                failure_call_id,
-                payload_outputs_custom,
-                err,
-            )),
+            Ok(response) => {
+                tracing::warn!(
+                    "📥 工具调用 {} (call_id: {}) 完成",
+                    tool_name_clone,
+                    failure_call_id
+                );
+                Ok(response)
+            }
+            Err(FunctionCallError::Fatal(message)) => {
+                tracing::warn!(
+                    "💥 工具调用 {} (call_id: {}) 发生致命错误: {}",
+                    tool_name_clone,
+                    failure_call_id,
+                    message
+                );
+                Err(FunctionCallError::Fatal(message))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "⚠️ 工具调用 {} (call_id: {}) 失败: {:?}",
+                    tool_name_clone,
+                    failure_call_id,
+                    err
+                );
+                Ok(Self::failure_response(
+                    failure_call_id,
+                    payload_outputs_custom,
+                    err,
+                ))
+            }
         }
     }
 

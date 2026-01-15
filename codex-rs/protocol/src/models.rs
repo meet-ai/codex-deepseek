@@ -77,6 +77,14 @@ pub enum ResponseItem {
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
+        /// For DeepSeek thinking mode, reasoning_content from assistant messages
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reasoning_content: Option<String>,
+        /// For tool calls, the tool_calls array from assistant messages
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        tool_calls: Option<Vec<serde_json::Value>>,
     },
     Reasoning {
         #[serde(default, skip_serializing)]
@@ -285,10 +293,12 @@ impl From<DeveloperInstructions> for ResponseItem {
     fn from(di: DeveloperInstructions) -> Self {
         ResponseItem::Message {
             id: None,
-            role: "developer".to_string(),
+            role: "user".to_string(), // DeepSeek doesn't support "developer" role
             content: vec![ContentItem::InputText {
                 text: di.into_text(),
             }],
+            reasoning_content: None,
+            tool_calls: None,
         }
     }
 }
@@ -455,9 +465,11 @@ impl From<ResponseInputItem> for ResponseItem {
     fn from(item: ResponseInputItem) -> Self {
         match item {
             ResponseInputItem::Message { role, content } => Self::Message {
+                id: None,
                 role,
                 content,
-                id: None,
+                reasoning_content: None,
+                tool_calls: None,
             },
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 Self::FunctionCallOutput { call_id, output }

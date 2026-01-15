@@ -350,7 +350,7 @@ fn assert_instructions_message(item: &ResponseItem) {
 fn assert_permissions_message(item: &ResponseItem) {
     match item {
         ResponseItem::Message { role, content, .. } => {
-            assert_eq!(role, "developer");
+            assert_eq!(role, "user");
             let texts = content_texts(content);
             let expected = DeveloperInstructions::from_policy(
                 &SandboxPolicy::DangerFullAccess,
@@ -371,7 +371,7 @@ fn assert_permissions_message(item: &ResponseItem) {
 fn assert_developer_message(item: &ResponseItem, expected_text: &str) {
     match item {
         ResponseItem::Message { role, content, .. } => {
-            assert_eq!(role, "developer");
+            assert_eq!(role, "user");
             let texts = content_texts(content);
             assert_eq!(
                 texts,

@@ -59,11 +59,16 @@ impl<T: HttpTransport, A: AuthProvider> ChatClient<T, A> {
     ) -> Result<ResponseStream, ApiError> {
         use crate::requests::ChatRequestBuilder;
 
-        let request =
-            ChatRequestBuilder::new(model, &prompt.instructions, &prompt.input, &prompt.tools)
-                .conversation_id(conversation_id)
-                .session_source(session_source)
-                .build(self.streaming.provider())?;
+        let request = ChatRequestBuilder::new(
+            model,
+            &prompt.instructions,
+            &prompt.input,
+            &prompt.tools,
+            prompt.reasoning_content.clone(),
+        )
+        .conversation_id(conversation_id)
+        .session_source(session_source)
+        .build(self.streaming.provider())?;
 
         self.stream_request(request).await
     }
@@ -189,6 +194,8 @@ impl Stream for AggregatedStream {
                             content: vec![ContentItem::OutputText {
                                 text: std::mem::take(&mut this.cumulative),
                             }],
+                            reasoning_content: None,
+                            tool_calls: None,
                         };
                         this.pending
                             .push_back(ResponseEvent::OutputItemDone(aggregated_message));

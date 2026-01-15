@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
@@ -43,7 +44,6 @@ use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
 use serde_json::Value;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -263,7 +263,12 @@ impl ModelClientSession {
         let model_info = self.state.model_info.clone();
         let instructions = prompt.get_full_instructions(&model_info).into_owned();
         let tools_json: Vec<Value> = create_tools_json_for_responses_api(&prompt.tools)?;
-        Ok(build_api_prompt(prompt, instructions, tools_json))
+        Ok(build_api_prompt(
+            prompt,
+            instructions,
+            tools_json,
+            prompt.reasoning_content.clone(),
+        ))
     }
 
     fn build_responses_options(
@@ -434,7 +439,12 @@ impl ModelClientSession {
         let model_info = self.state.model_info.clone();
         let instructions = prompt.get_full_instructions(&model_info).into_owned();
         let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
-        let api_prompt = build_api_prompt(prompt, instructions, tools_json);
+        let api_prompt = build_api_prompt(
+            prompt,
+            instructions,
+            tools_json,
+            prompt.reasoning_content.clone(),
+        );
         let conversation_id = self.state.conversation_id.to_string();
         let session_source = self.state.session_source.clone();
 
@@ -456,14 +466,327 @@ impl ModelClientSession {
             let client = ApiChatClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
 
-            let stream_result = client
-                .stream_prompt(
+            // 记录 LLM 请求内容
+            let prompt_text = api_prompt
+                .input
+                .iter()
+                .filter_map(|item| match item {
+                    codex_protocol::models::ResponseItem::Message { role, content, .. } => {
+                        let content_text = content
+                            .iter()
+                            .filter_map(|ci| match ci {
+                                codex_protocol::models::ContentItem::OutputText { text } => {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let role_prefix = match role.as_str() {
+                            "user" => "[用户]",
+                            "assistant" => "[助手]",
+                            "system" => "[系统]",
+                            _ => &format!("[{}]", role),
+                        };
+
+                        if content_text.is_empty() {
+                            // 跳过空的消息
+                            None
+                        } else {
+                            Some(format!("{} {}", role_prefix, content_text))
+                        }
+                    }
+                    codex_protocol::models::ResponseItem::FunctionCall {
+                        name,
+                        arguments,
+                        call_id,
+                        ..
+                    } => Some(format!(
+                        "[工具调用] {} (call_id: {}) 参数: {}",
+                        name, call_id, arguments
+                    )),
+                    codex_protocol::models::ResponseItem::FunctionCallOutput {
+                        call_id,
+                        output,
+                        ..
+                    } => Some(format!(
+                        "[工具结果] call_id: {} 输出: {}",
+                        call_id, output.content
+                    )),
+                    _ => Some(format!("[其他] {:?}", std::mem::discriminant(item))),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            tracing::warn!(
+                "🚀 发送 LLM 请求 - 模型: {} 会话: {} 提示词长度: {} 字符",
+                self.state.model_info.slug,
+                conversation_id,
+                prompt_text.len()
+            );
+
+            if !prompt_text.is_empty() && prompt_text.len() <= 200 {
+                tracing::warn!("📝 用户提示: {}", prompt_text);
+            } else if !prompt_text.is_empty() {
+                // 安全的UTF-8字符串截断
+                let truncated = prompt_text.chars().take(200).collect::<String>();
+                tracing::warn!("📝 用户提示 (前200字符): {}...", truncated);
+            }
+
+            // 显示完整的API prompt结构，帮助调试
+            tracing::warn!(
+                "📋 API Prompt详情 - 指令长度: {}, 输入项数: {}, 工具数: {}",
+                api_prompt.instructions.len(),
+                api_prompt.input.len(),
+                api_prompt.tools.len()
+            );
+
+            // 显示所有输入项的详细内容
+            for (i, item) in api_prompt.input.iter().enumerate() {
+                match item {
+                    codex_protocol::models::ResponseItem::Message { role, content, .. } => {
+                        let content_texts: Vec<String> = content
+                            .iter()
+                            .filter_map(|c| match c {
+                                codex_protocol::models::ContentItem::OutputText { text } => {
+                                    Some(text.clone())
+                                }
+                                codex_protocol::models::ContentItem::InputText { text } => {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let total_len: usize = content_texts.iter().map(|s| s.len()).sum();
+                        tracing::warn!(
+                            "📄 输入项 {} - 角色: {}, 内容长度: {}, 内容: {:?}",
+                            i,
+                            role,
+                            total_len,
+                            content_texts
+                        );
+                    }
+                    codex_protocol::models::ResponseItem::FunctionCall {
+                        name,
+                        arguments,
+                        call_id,
+                        ..
+                    } => {
+                        tracing::warn!(
+                            "📄 输入项 {} - 工具调用: {} (call_id: {}) 参数长度: {}",
+                            i,
+                            name,
+                            call_id,
+                            arguments.len()
+                        );
+                    }
+                    codex_protocol::models::ResponseItem::FunctionCallOutput {
+                        call_id,
+                        output,
+                        ..
+                    } => {
+                        tracing::warn!(
+                            "📄 输入项 {} - 工具结果: call_id: {} 输出长度: {}",
+                            i,
+                            call_id,
+                            output.content.len()
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "📄 输入项 {} - 类型: {:?}",
+                            i,
+                            std::mem::discriminant(item)
+                        );
+                    }
+                }
+            }
+
+            tracing::warn!(
+                "🚀 调用API client.stream_prompt - 模型: {}, 会话: {}",
+                &self.state.model_info.slug,
+                conversation_id
+            );
+            tracing::warn!(
+                "📊 请求详情 - 输入项数: {}, 工具数: {}",
+                api_prompt.input.len(),
+                api_prompt.tools.len()
+            );
+
+            // 记录关键的请求内容用于调试
+            if let Some(last_item) = api_prompt.input.last() {
+                match last_item {
+                    codex_protocol::models::ResponseItem::FunctionCallOutput {
+                        call_id,
+                        output,
+                        ..
+                    } => {
+                        tracing::warn!(
+                            "🔍 最后输入项是工具结果 - call_id: {}, 输出长度: {}",
+                            call_id,
+                            output.content.len()
+                        );
+                        // 显示输出内容的前200字符
+                        let preview = if output.content.len() > 200 {
+                            format!("{}...", &output.content[..200])
+                        } else {
+                            output.content.clone()
+                        };
+                        tracing::warn!("🔍 工具结果预览: {}", preview);
+                    }
+                    codex_protocol::models::ResponseItem::FunctionCall {
+                        name, call_id, ..
+                    } => {
+                        tracing::warn!(
+                            "🔍 最后输入项是工具调用 - 工具: {}, call_id: {}",
+                            name,
+                            call_id
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "🔍 最后输入项类型: {:?}",
+                            std::mem::discriminant(last_item)
+                        );
+                    }
+                }
+            }
+
+            // DeepSeek兼容性检查
+            tracing::warn!("🔧 DeepSeek兼容性: 检查请求格式");
+            let has_function_call_output = api_prompt.input.iter().any(|item| {
+                matches!(
+                    item,
+                    codex_protocol::models::ResponseItem::FunctionCallOutput { .. }
+                )
+            });
+            let has_function_call = api_prompt.input.iter().any(|item| {
+                matches!(
+                    item,
+                    codex_protocol::models::ResponseItem::FunctionCall { .. }
+                )
+            });
+
+            if has_function_call_output {
+                tracing::warn!("🔄 检测到工具结果 - DeepSeek: 准备发送工具结果");
+
+                // 按照DeepSeek文档的正确格式：
+                // 1. 保留所有历史消息
+                // 2. 为每个FunctionCallOutput创建对应的tool消息
+                // 3. 确保格式正确：assistant消息 -> tool消息
+
+                let mut messages_with_tools = Vec::new();
+
+                // 复制所有输入项，但转换FunctionCallOutput为tool消息
+                for item in &api_prompt.input {
+                    match item {
+                        codex_protocol::models::ResponseItem::FunctionCallOutput {
+                            call_id,
+                            output,
+                            ..
+                        } => {
+                            // 创建tool消息，按照DeepSeek要求格式
+                            let tool_message = codex_protocol::models::ResponseItem::Message {
+                                id: Some(call_id.clone()),
+                                role: "tool".to_string(),
+                                content: vec![codex_protocol::models::ContentItem::OutputText {
+                                    text: output.content.clone(),
+                                }],
+                                reasoning_content: None,
+                                tool_calls: None,
+                            };
+                            messages_with_tools.push(tool_message);
+
+                            tracing::warn!(
+                                "🔧 DeepSeek: 创建tool消息 - call_id: {}, content长度: {}",
+                                call_id,
+                                output.content.len()
+                            );
+                        }
+                        // 保留所有其他消息，包括FunctionCall（如果有的话）
+                        other => {
+                            messages_with_tools.push(other.clone());
+                        }
+                    }
+                }
+
+                // 创建新的prompt
+                let mut modified_prompt = api_prompt.clone();
+                modified_prompt.input = messages_with_tools;
+
+                tracing::warn!(
+                    "🔄 DeepSeek: 发送工具结果 (输入项数: {})",
+                    modified_prompt.input.len()
+                );
+
+                let stream_future = client.stream_prompt(
                     &self.state.model_info.slug,
-                    &api_prompt,
+                    &modified_prompt,
                     Some(conversation_id.clone()),
                     Some(session_source.clone()),
-                )
-                .await;
+                );
+
+                let stream_result =
+                    match tokio::time::timeout(Duration::from_secs(30), stream_future).await {
+                        Ok(result) => {
+                            tracing::warn!("✅ DeepSeek工具结果发送成功");
+                            result
+                        }
+                        Err(_) => {
+                            tracing::warn!("❌ DeepSeek工具结果发送超时");
+                            return Err(CodexErr::Stream("DeepSeek工具结果发送超时".into(), None));
+                        }
+                    };
+
+                return match stream_result {
+                    Ok(stream) => Ok(stream),
+                    Err(e) => {
+                        tracing::warn!("❌ DeepSeek工具结果发送失败: {:?}", e);
+                        Err(map_api_error(e))
+                    }
+                };
+            }
+            if has_function_call {
+                tracing::warn!("✅ 请求包含工具调用");
+            }
+
+            tracing::warn!("⏳ 开始30秒超时等待API响应");
+            let stream_future = client.stream_prompt(
+                &self.state.model_info.slug,
+                &api_prompt,
+                Some(conversation_id.clone()),
+                Some(session_source.clone()),
+            );
+
+            tracing::warn!("⏳ 开始30秒超时等待API响应");
+
+            let stream_result =
+                match tokio::time::timeout(Duration::from_secs(30), stream_future).await {
+                    Ok(result) => {
+                        tracing::warn!(
+                            "✅ API调用在超时前完成 - 结果: {:?}",
+                            result
+                                .as_ref()
+                                .map(|_| "成功")
+                                .map_err(|e| format!("错误: {}", e))
+                        );
+                        result
+                    }
+                    Err(_) => {
+                        tracing::warn!("❌ API调用超时 (30秒) - 可能是网络问题或API不可用");
+                        return Err(CodexErr::Stream(
+                            "API request timeout after 30 seconds".into(),
+                            None,
+                        ));
+                    }
+                };
+            tracing::warn!(
+                "📨 API stream_prompt调用完成，结果: {:?}",
+                stream_result
+                    .as_ref()
+                    .map(|_| "成功")
+                    .map_err(|e| format!("错误: {:?}", e))
+            );
 
             match stream_result {
                 Ok(stream) => return Ok(stream),
@@ -604,13 +927,19 @@ impl ModelClient {
 }
 
 /// Adapts the core `Prompt` type into the `codex-api` payload shape.
-fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value>) -> ApiPrompt {
+fn build_api_prompt(
+    prompt: &Prompt,
+    instructions: String,
+    tools_json: Vec<Value>,
+    reasoning_content: Option<String>,
+) -> ApiPrompt {
     ApiPrompt {
         instructions,
         input: prompt.get_formatted_input(),
         tools: tools_json,
         parallel_tool_calls: prompt.parallel_tool_calls,
         output_schema: prompt.output_schema.clone(),
+        reasoning_content,
     }
 }
 

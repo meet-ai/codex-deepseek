@@ -14,6 +14,8 @@ pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    /// Store reasoning_content from DeepSeek assistant messages for subsequent requests
+    pub(crate) current_reasoning_content: Option<String>,
 }
 
 impl SessionState {
@@ -24,10 +26,24 @@ impl SessionState {
             session_configuration,
             history,
             latest_rate_limits: None,
+            current_reasoning_content: None,
         }
     }
 
     // History helpers
+    // Reasoning content helpers for DeepSeek thinking mode
+    pub(crate) fn set_reasoning_content(&mut self, content: String) {
+        self.current_reasoning_content = Some(content);
+    }
+
+    pub(crate) fn get_reasoning_content(&self) -> Option<&str> {
+        self.current_reasoning_content.as_deref()
+    }
+
+    pub(crate) fn clear_reasoning_content(&mut self) {
+        self.current_reasoning_content = None;
+    }
+
     pub(crate) fn record_items<I>(&mut self, items: I, policy: TruncationPolicy)
     where
         I: IntoIterator,

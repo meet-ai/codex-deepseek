@@ -90,7 +90,7 @@ fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMes
 
 pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
     match item {
-        ResponseItem::Message { role, content, id } => match role.as_str() {
+        ResponseItem::Message { role, content, id, reasoning_content: _, tool_calls: _ } => match role.as_str() {
             "user" => parse_user_message(content).map(TurnItem::UserMessage),
             "assistant" => Some(TurnItem::AgentMessage(parse_agent_message(
                 id.as_ref(),

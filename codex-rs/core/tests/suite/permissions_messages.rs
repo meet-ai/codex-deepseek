@@ -23,7 +23,7 @@ fn permissions_texts(input: &[serde_json::Value]) -> Vec<String> {
         .iter()
         .filter_map(|item| {
             let role = item.get("role")?.as_str()?;
-            if role != "developer" {
+            if role != "user" {
                 return None;
             }
             let text = item
