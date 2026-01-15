@@ -9,6 +9,7 @@ use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
+use http::StatusCode;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -148,6 +149,10 @@ impl<'a> ChatRequestBuilder<'a> {
         }
 
         let mut last_assistant_text: Option<String> = None;
+        // Track pending tool calls that haven't been responded to yet
+        let mut pending_tool_call_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut last_assistant_with_tool_calls_index: Option<usize> = None;
 
         for (idx, item) in input.iter().enumerate() {
             match item {
@@ -158,6 +163,21 @@ impl<'a> ChatRequestBuilder<'a> {
                     } else {
                         role.as_str()
                     };
+
+                    // If we encounter a user or assistant message while there are pending tool calls,
+                    // remove the last assistant message with tool_calls (it's incomplete)
+                    if (role == "user" || role == "assistant")
+                        && !pending_tool_call_ids.is_empty()
+                        && last_assistant_with_tool_calls_index.is_some()
+                    {
+                        // Remove the incomplete assistant message with tool_calls
+                        messages.retain(|msg| {
+                            !(msg.get("role").and_then(Value::as_str) == Some("assistant")
+                                && msg.get("tool_calls").is_some())
+                        });
+                        pending_tool_call_ids.clear();
+                        last_assistant_with_tool_calls_index = None;
+                    }
 
                     let mut text = String::new();
                     let mut items: Vec<Value> = Vec::new();
@@ -220,7 +240,15 @@ impl<'a> ChatRequestBuilder<'a> {
                             "arguments": arguments,
                         }
                     });
+                    pending_tool_call_ids.insert(call_id.clone());
                     push_tool_call_message(&mut messages, tool_call, reasoning);
+                    // Track that we just added an assistant message with tool_calls
+                    if let Some(last_msg) = messages.last()
+                        && last_msg.get("role").and_then(Value::as_str) == Some("assistant")
+                        && last_msg.get("tool_calls").is_some()
+                    {
+                        last_assistant_with_tool_calls_index = Some(idx);
+                    }
                 }
                 ResponseItem::LocalShellCall {
                     id,
@@ -229,15 +257,31 @@ impl<'a> ChatRequestBuilder<'a> {
                     action,
                 } => {
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
+                    let call_id = id.clone().unwrap_or_default();
+                    let call_id_clone = call_id.clone();
                     let tool_call = json!({
-                        "id": id.clone().unwrap_or_default(),
+                        "id": call_id_clone.clone(),
                         "type": "local_shell_call",
                         "status": status,
                         "action": action,
                     });
+                    pending_tool_call_ids.insert(call_id_clone);
                     push_tool_call_message(&mut messages, tool_call, reasoning);
+                    // Track that we just added an assistant message with tool_calls
+                    if let Some(last_msg) = messages.last()
+                        && last_msg.get("role").and_then(Value::as_str) == Some("assistant")
+                        && last_msg.get("tool_calls").is_some()
+                    {
+                        last_assistant_with_tool_calls_index = Some(idx);
+                    }
                 }
                 ResponseItem::FunctionCallOutput { call_id, output } => {
+                    // Remove this call_id from pending set
+                    pending_tool_call_ids.remove(call_id.as_str());
+                    if pending_tool_call_ids.is_empty() {
+                        last_assistant_with_tool_calls_index = None;
+                    }
+
                     let content_value = if let Some(items) = &output.content_items {
                         let mapped: Vec<Value> = items
                             .iter()
@@ -263,23 +307,40 @@ impl<'a> ChatRequestBuilder<'a> {
                 }
                 ResponseItem::CustomToolCall {
                     id,
-                    call_id: _,
+                    call_id,
                     name,
                     input,
                     status: _,
                 } => {
+                    // Use call_id for tracking, but id (if present) for the tool_call JSON
+                    let tool_call_id = id.clone().unwrap_or_else(|| call_id.clone());
+                    let call_id_for_tracking = call_id.clone();
                     let tool_call = json!({
-                        "id": id,
+                        "id": tool_call_id,
                         "type": "custom",
                         "custom": {
                             "name": name,
                             "input": input,
                         }
                     });
+                    pending_tool_call_ids.insert(call_id_for_tracking);
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
                     push_tool_call_message(&mut messages, tool_call, reasoning);
+                    // Track that we just added an assistant message with tool_calls
+                    if let Some(last_msg) = messages.last()
+                        && last_msg.get("role").and_then(Value::as_str) == Some("assistant")
+                        && last_msg.get("tool_calls").is_some()
+                    {
+                        last_assistant_with_tool_calls_index = Some(idx);
+                    }
                 }
                 ResponseItem::CustomToolCallOutput { call_id, output } => {
+                    // Remove this call_id from pending set
+                    pending_tool_call_ids.remove(call_id.as_str());
+                    if pending_tool_call_ids.is_empty() {
+                        last_assistant_with_tool_calls_index = None;
+                    }
+
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -298,6 +359,10 @@ impl<'a> ChatRequestBuilder<'a> {
             }
         }
 
+        // Validate that every assistant message with tool_calls (except possibly the last one) is followed by corresponding tool messages
+        // The last message may have tool_calls without tool responses if it's the start of the current request
+        validate_tool_calls_sequence(&messages)?;
+
         let payload = json!({
             "model": self.model,
             "messages": messages,
@@ -315,6 +380,75 @@ impl<'a> ChatRequestBuilder<'a> {
             headers,
         })
     }
+}
+
+fn validate_tool_calls_sequence(messages: &[Value]) -> Result<(), ApiError> {
+    // Skip the system message (index 0)
+    let mut i = 1;
+    while i < messages.len() {
+        let msg = &messages[i];
+        if let Some(role) = msg.get("role").and_then(Value::as_str)
+            && role == "assistant"
+            && let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array)
+        {
+            // Collect all tool_call_ids from this assistant message
+            let mut expected_call_ids: Vec<&str> = Vec::new();
+            for tool_call in tool_calls {
+                if let Some(call_id) = tool_call.get("id").and_then(Value::as_str) {
+                    expected_call_ids.push(call_id);
+                }
+            }
+
+            if !expected_call_ids.is_empty() {
+                // Check that the next messages are tool messages with matching call_ids
+                let mut found_call_ids = std::collections::HashSet::new();
+                let mut j = i + 1;
+                let mut saw_non_tool_message = false;
+
+                while j < messages.len() {
+                    let next_msg = &messages[j];
+                    if let Some(next_role) = next_msg.get("role").and_then(Value::as_str) {
+                        if next_role == "tool" {
+                            if let Some(call_id) =
+                                next_msg.get("tool_call_id").and_then(Value::as_str)
+                            {
+                                found_call_ids.insert(call_id);
+                                j += 1;
+                                continue;
+                            }
+                        } else {
+                            // Stop at next non-tool message (assistant, user, or system)
+                            saw_non_tool_message = true;
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+
+                // Only validate if we saw a non-tool message after the tool messages
+                // This means the tool call sequence is complete and should have all responses
+                // If we reached the end without seeing a non-tool message, this might be the
+                // start of the current request (tool calls without responses yet)
+                if saw_non_tool_message {
+                    // Check if all expected call_ids have corresponding tool messages
+                    for call_id in &expected_call_ids {
+                        if !found_call_ids.contains(call_id) {
+                            return Err(ApiError::Api {
+                                status: StatusCode::BAD_REQUEST,
+                                message: format!(
+                                    "Missing tool message for tool_call_id: {call_id}. An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.",
+                                ),
+                            });
+                        }
+                    }
+                }
+                // If we didn't see a non-tool message, this might be the last message
+                // (start of current request), so skip validation
+            }
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn push_tool_call_message(messages: &mut Vec<Value>, tool_call: Value, reasoning: Option<&str>) {
